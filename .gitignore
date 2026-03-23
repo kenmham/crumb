@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# crumb runtime data
+*.db
+config.ini
+identifiers
+
+# macOS
+.DS_Store
+
+# Environment
+.env
+
+# Internal
+SPEC.md
