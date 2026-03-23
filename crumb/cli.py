@@ -5,9 +5,9 @@ from datetime import date, datetime, timedelta
 from . import db
 from .config import (DATA_TYPES, IDENTIFIERS_PATH, STATUS_VALUES, STATUS_WEIGHTS,
                      add_identifier, load_identifiers)
-from .scanner import (CANONICAL_NAMES, SHIPPING_SENDERS, connect, detect_data_types,
-                      fetch_body, fetch_senders, get_credentials, group_senders,
-                      guess_name, match_identifiers, normalize_domain, review_candidates)
+from .scanner import (CANONICAL_NAMES, SHIPPING_SENDERS, connect,
+                      fetch_bodies_concurrent, fetch_senders, get_credentials,
+                      group_senders, guess_name, normalize_domain, review_candidates)
 
 
 # ---------------------------------------------------------------------------
@@ -290,17 +290,27 @@ def cmd_scan(args, conn):
         domains_found = len(groups)
         print(f"  {domains_found} unique domains, {len(new)} new")
 
+        try:
+            imap.close()
+        except Exception:
+            pass
+        imap.logout()
+
         id_hashes = load_identifiers()
-        candidates = []
         new_items = list(new.items())
-        for i, (domain, g) in enumerate(new_items, 1):
-            detected = {"email"}
-            if not args.no_extract:
-                sys.stderr.write(f"\r  Analyzing [{i}/{len(new_items)}] {domain:<50}")
-                sys.stderr.flush()
-                text = fetch_body(imap, g["uids"][0])
-                detected.update(detect_data_types(text))
-                detected.update(match_identifiers(text, id_hashes))
+        if not args.no_extract and new_items:
+            detected_map = fetch_bodies_concurrent(
+                new_items, host, user, password,
+                folder=folders[-1],
+                id_hashes=id_hashes,
+                workers=4,
+            )
+        else:
+            detected_map = {}
+
+        candidates = []
+        for domain, g in new_items:
+            detected = detected_map.get(domain, {"email"})
             relay = g["relay_address"]
             candidates.append({
                 "domain": domain,
@@ -312,16 +322,6 @@ def cmd_scan(args, conn):
                 "hide_my_email": relay is not None,
                 "identifier": relay,
             })
-
-        if not args.no_extract and new_items:
-            sys.stderr.write("\n")
-            sys.stderr.flush()
-
-        try:
-            imap.close()
-        except Exception:
-            pass
-        imap.logout()
 
         # Mark all fetched domains as seen immediately so future fetches skip them,
         # regardless of whether the review completes.

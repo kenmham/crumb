@@ -5,6 +5,8 @@ import getpass
 import imaplib
 import re
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from email.utils import parseaddr
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
@@ -67,15 +69,22 @@ def _relay_addr(to_header: str) -> Optional[str]:
     return addr if _RELAY_RE.match(addr) else None
 
 
+_FETCH_BATCH = 500
+_SEQ_RE = re.compile(rb"^(\d+)\s")
+
+
 def fetch_senders(imap: imaplib.IMAP4_SSL, folder: str = "INBOX",
                   limit: int = 0,
                   since_date: Optional[str] = None) -> List[Tuple[str, str, str, Optional[str]]]:
-    """Return [(from_addr, date_str, uid, relay_or_None), ...] for messages in folder.
+    """Return [(from_addr, date_str, seq, relay_or_None), ...] for messages in folder.
 
     since_date: IMAP SINCE criterion string, e.g. '21-Mar-2026'.  If given, only
     messages on or after that date are fetched.
+
+    Headers are fetched in batches of _FETCH_BATCH to minimise round-trips.
     """
-    status, _ = imap.select(folder, readonly=True)
+    quoted_folder = f'"{folder}"' if any(c in folder for c in ' []()\\') else folder
+    status, _ = imap.select(quoted_folder, readonly=True)
     if status != "OK":
         sys.stderr.write(f"  Warning: folder {folder!r} not found, skipping.\n")
         return []
@@ -86,22 +95,29 @@ def fetch_senders(imap: imaplib.IMAP4_SSL, folder: str = "INBOX",
         uids = uids[-limit:]
     total = len(uids)
     results = []
-    for i, uid in enumerate(uids, 1):
-        try:
-            _, msg_data = imap.fetch(uid, "(BODY.PEEK[HEADER.FIELDS (FROM TO DATE)])")
-            part = msg_data[0]
-            if not isinstance(part, tuple):
-                continue
-            msg = email.message_from_bytes(part[1])
-            _, addr = parseaddr(msg.get("From", ""))
-            date_str = msg.get("Date", "")
-            relay = _relay_addr(msg.get("To", ""))
-            if addr and "@" in addr:
-                results.append((addr.lower(), date_str, uid.decode(), relay))
-            _progress(i, total, addr or "—")
-        except Exception:
-            _progress(i, total, "—")
-            continue
+    processed = 0
+    try:
+        for batch_start in range(0, total, _FETCH_BATCH):
+            batch = uids[batch_start:batch_start + _FETCH_BATCH]
+            uid_set = b",".join(batch)
+            _, msg_data = imap.fetch(uid_set, "(BODY.PEEK[HEADER.FIELDS (FROM TO DATE)])")
+            for part in msg_data:
+                if not isinstance(part, tuple):
+                    continue
+                processed += 1
+                m = _SEQ_RE.match(part[0])
+                seq = m.group(1).decode() if m else ""
+                msg = email.message_from_bytes(part[1])
+                _, addr = parseaddr(msg.get("From", ""))
+                date_str = msg.get("Date", "")
+                relay = _relay_addr(msg.get("To", ""))
+                if addr and "@" in addr:
+                    results.append((addr.lower(), date_str, seq, relay))
+                _progress(processed, total, addr or "—")
+    except KeyboardInterrupt:
+        sys.stderr.write(f"\n  (interrupted at {len(results)}/{total})\n")
+        sys.stderr.flush()
+        return results
     sys.stderr.write("\n")
     sys.stderr.flush()
     return results
@@ -127,6 +143,73 @@ def fetch_body(imap: imaplib.IMAP4_SSL, uid: str, max_bytes: int = 4096) -> str:
     except Exception:
         pass
     return ""
+
+
+def fetch_bodies_concurrent(
+    items: List[Tuple[str, dict]],
+    host: str,
+    user: str,
+    password: str,
+    folder: str,
+    id_hashes: dict,
+    workers: int = 4,
+) -> Dict[str, Set[str]]:
+    """Fetch and analyse message bodies for *items* using a thread pool.
+
+    Each worker opens its own IMAP connection (max *workers* simultaneous
+    connections, well within Gmail's 15-connection limit).  Items are
+    interleaved across partitions so slow/fast domains spread evenly.
+
+    Returns {domain: set_of_detected_data_types}.
+    """
+    if not items:
+        return {}
+
+    total = len(items)
+    counter = [0]
+    lock = threading.Lock()
+
+    n_workers = min(workers, total)
+    # Interleave so each worker gets a representative spread, not a contiguous block.
+    partitions = [items[i::n_workers] for i in range(n_workers)]
+
+    def _worker(partition: List[Tuple[str, dict]]) -> Dict[str, Set[str]]:
+        local: Dict[str, Set[str]] = {}
+        imap = connect(host, user, password)
+        try:
+            quoted = f'"{folder}"' if any(c in folder for c in ' []()\\') else folder
+            imap.select(quoted, readonly=True)
+            for domain, g in partition:
+                try:
+                    text = fetch_body(imap, g["uids"][0])
+                except Exception:
+                    text = ""
+                detected: Set[str] = {"email"}
+                detected.update(detect_data_types(text))
+                detected.update(match_identifiers(text, id_hashes))
+                local[domain] = detected
+                with lock:
+                    counter[0] += 1
+                    n = counter[0]
+                    sys.stderr.write(f"\r  Analyzing [{n}/{total}] {domain:<50}")
+                    sys.stderr.flush()
+        finally:
+            try:
+                imap.close()
+            except Exception:
+                pass
+            imap.logout()
+        return local
+
+    combined: Dict[str, Set[str]] = {}
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        futures = [executor.submit(_worker, p) for p in partitions]
+        for future in as_completed(futures):
+            combined.update(future.result())
+
+    sys.stderr.write("\n")
+    sys.stderr.flush()
+    return combined
 
 
 # ---------------------------------------------------------------------------
