@@ -4,10 +4,11 @@ from datetime import date, datetime, timedelta
 
 from . import db
 from .config import (DATA_TYPES, IDENTIFIERS_PATH, STATUS_VALUES, STATUS_WEIGHTS,
-                     add_identifier, load_identifiers)
+                     add_identifier, get_extract_depth, load_identifiers)
 from .scanner import (CANONICAL_NAMES, SHIPPING_SENDERS, connect,
                       fetch_bodies_concurrent, fetch_senders, get_credentials,
-                      group_senders, guess_name, normalize_domain, review_candidates)
+                      group_senders, guess_name, normalize_domain, review_candidates,
+                      search_domain_uids)
 
 
 # ---------------------------------------------------------------------------
@@ -255,6 +256,9 @@ def _risk(svc, downstream: int = 0) -> float:
 # ---------------------------------------------------------------------------
 
 def cmd_scan(args, conn):
+    if args.reextract:
+        return cmd_reextract(args, conn)
+
     folders = args.folder  # list of folder names
     # Stable key shared across all folders in this scan session.
     pending_key = "|".join(sorted(folders))
@@ -304,6 +308,7 @@ def cmd_scan(args, conn):
                 folder=folders[-1],
                 id_hashes=id_hashes,
                 workers=4,
+                depth=get_extract_depth(),
             )
         else:
             detected_map = {}
@@ -338,6 +343,13 @@ def cmd_scan(args, conn):
     def _on_processed(domain: str) -> None:
         db.remove_pending(conn, pending_key, domain)
 
+    # Drain any pending candidates already in known_domains (added during a
+    # previous run) so they don't block the pending queue indefinitely.
+    for c in candidates:
+        if c["domain"] in known:
+            _on_processed(c["domain"])
+    candidates = [c for c in candidates if c["domain"] not in known]
+
     if args.auto:
         confirmed = candidates
         for c in candidates:
@@ -368,6 +380,68 @@ def cmd_scan(args, conn):
     else:
         remaining = db.count_pending(conn, pending_key)
         print(f"\nDone. {added} service(s) added. {remaining} domain(s) pending — run scan again to continue.")
+
+
+# ---------------------------------------------------------------------------
+# reextract (called via scan --reextract)
+# ---------------------------------------------------------------------------
+
+def cmd_reextract(args, conn):
+    import json as _json
+    services = [s for s in db.get_services(conn) if s.status != "deleted"]
+    if not services:
+        print("No services in ledger.")
+        return
+
+    host, user, password = get_credentials()
+    folder = args.folder[-1]
+    depth = get_extract_depth()
+
+    print(f"Connecting to {host}...")
+    imap = connect(host, user, password)
+    quoted = f'"{folder}"' if any(c in folder for c in ' []()\\') else folder
+    imap.select(quoted, readonly=True)
+
+    print(f"Searching {folder} for {len(services)} service domain(s)...")
+    items = []
+    for s in services:
+        uids = search_domain_uids(imap, s.domain, depth)
+        if uids:
+            items.append((s.domain, {"uids": uids}))
+    try:
+        imap.close()
+    except Exception:
+        pass
+    imap.logout()
+
+    if not items:
+        print("No emails found for any service.")
+        return
+
+    print(f"  Re-extracting from {len(items)} service(s) ({depth} email(s) each)...")
+    id_hashes = load_identifiers()
+    detected_map = fetch_bodies_concurrent(
+        items, host, user, password,
+        folder=folder,
+        id_hashes=id_hashes,
+        workers=4,
+        depth=depth,
+    )
+
+    domain_to_service = {s.domain: s for s in services}
+    updated = 0
+    for domain, detected in detected_map.items():
+        s = domain_to_service.get(domain)
+        if not s:
+            continue
+        new_types = detected - set(s.data_types)
+        if new_types:
+            merged = list(dict.fromkeys(s.data_types + sorted(new_types)))
+            db.update_service(conn, s.id, data_types=_json.dumps(merged))
+            updated += 1
+            print(f"  {s.name} ({domain}): +{', '.join(sorted(new_types))}")
+
+    print(f"\nDone. {updated} service(s) updated.")
 
 
 # ---------------------------------------------------------------------------
@@ -736,6 +810,8 @@ def main():
     ps.add_argument("--limit", type=int, default=0, metavar="N", help="Cap at N most recent messages")
     ps.add_argument("--no-extract", action="store_true", help="Skip body extraction")
     ps.add_argument("--auto", action="store_true", help="Skip interactive review")
+    ps.add_argument("--reextract", action="store_true",
+                    help="Re-run body extraction on existing services and update data types")
 
     args = p.parse_args()
     conn = db.get_conn()

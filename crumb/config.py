@@ -84,6 +84,20 @@ def add_identifier(itype: str, value: str) -> bool:
     return True
 
 
+def get_extract_depth() -> int:
+    """Return extract_depth from [scan] config section (default 1).
+
+    Set in ~/.crumb/config.ini:
+        [scan]
+        extract_depth = 3
+    """
+    cfg = load_config()
+    try:
+        return max(1, cfg.getint("scan", "extract_depth"))
+    except (configparser.NoSectionError, configparser.NoOptionError, ValueError):
+        return 1
+
+
 def load_config() -> configparser.ConfigParser:
     cfg = configparser.ConfigParser()
     if CONFIG_PATH.exists():

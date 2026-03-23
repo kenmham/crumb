@@ -132,6 +132,15 @@ def _progress(current: int, total: int, sender: str) -> None:
     sys.stderr.flush()
 
 
+def search_domain_uids(imap: imaplib.IMAP4_SSL, domain: str, limit: int) -> List[str]:
+    """Return up to *limit* sequence numbers for messages whose From contains @domain."""
+    _, data = imap.search(None, f'FROM "@{domain}"')
+    seqs = data[0].split() if data[0] else []
+    if limit:
+        seqs = seqs[-limit:]
+    return [s.decode() for s in seqs]
+
+
 def fetch_body(imap: imaplib.IMAP4_SSL, uid: str, max_bytes: int = 4096) -> str:
     try:
         _, data = imap.fetch(uid, f"(BODY.PEEK[TEXT]<0.{max_bytes}>)")
@@ -153,12 +162,16 @@ def fetch_bodies_concurrent(
     folder: str,
     id_hashes: dict,
     workers: int = 4,
+    depth: int = 1,
 ) -> Dict[str, Set[str]]:
     """Fetch and analyse message bodies for *items* using a thread pool.
 
     Each worker opens its own IMAP connection (max *workers* simultaneous
     connections, well within Gmail's 15-connection limit).  Items are
     interleaved across partitions so slow/fast domains spread evenly.
+
+    *depth* controls how many emails per domain are sampled; detected types
+    are unioned across all sampled bodies.
 
     Returns {domain: set_of_detected_data_types}.
     """
@@ -180,13 +193,14 @@ def fetch_bodies_concurrent(
             quoted = f'"{folder}"' if any(c in folder for c in ' []()\\') else folder
             imap.select(quoted, readonly=True)
             for domain, g in partition:
-                try:
-                    text = fetch_body(imap, g["uids"][0])
-                except Exception:
-                    text = ""
                 detected: Set[str] = {"email"}
-                detected.update(detect_data_types(text))
-                detected.update(match_identifiers(text, id_hashes))
+                for uid in g["uids"][:depth]:
+                    try:
+                        text = fetch_body(imap, uid)
+                    except Exception:
+                        text = ""
+                    detected.update(detect_data_types(text))
+                    detected.update(match_identifiers(text, id_hashes))
                 local[domain] = detected
                 with lock:
                     counter[0] += 1
